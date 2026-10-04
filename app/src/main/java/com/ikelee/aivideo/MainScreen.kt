@@ -33,7 +33,6 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Image
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -160,8 +159,7 @@ private fun GeneratorPage(
     var withAudio by remember { mutableStateOf(true) }
     var watermark by remember { mutableStateOf(false) }
     var imagePath by remember { mutableStateOf<String?>(null) }
-    var imageUriForPreview by remember { mutableStateOf<Uri?>(null) }
-    var detailTask by remember { mutableStateOf<VideoTask?>(null) }
+    var detailTaskId by remember { mutableStateOf<String?>(null) }
 
     val pickImage = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
@@ -173,10 +171,8 @@ private fun GeneratorPage(
                 ImageUtils.compressToJpegFile(ctx, uri, outFile)
             }
             if (ok) {
-                // 删除旧图
                 imagePath?.let { old -> try { File(old).delete() } catch (_: Exception) {} }
                 imagePath = outFile.absolutePath
-                imageUriForPreview = uri
             }
         }
     }
@@ -197,7 +193,6 @@ private fun GeneratorPage(
                     Text("生成新视频", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(12.dp))
 
-                    // 首帧图
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         OutlinedButton(onClick = { pickImage.launch("image/*") }) {
                             Icon(Icons.Filled.Image, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -209,7 +204,6 @@ private fun GeneratorPage(
                             IconButton(onClick = {
                                 imagePath?.let { p -> try { File(p).delete() } catch (_: Exception) {} }
                                 imagePath = null
-                                imageUriForPreview = null
                             }) {
                                 Icon(Icons.Filled.Close, contentDescription = "移除")
                             }
@@ -342,8 +336,7 @@ private fun GeneratorPage(
                                 ctx, id, prompt, duration, size, fps, quality,
                                 withAudio, watermark, imagePath
                             )
-                            // 保留提示词，不清空
-                            // 保留图片，不清空
+                            // 保留提示词与首帧图，不清空
                         },
                         enabled = prompt.isNotBlank(),
                         modifier = Modifier.fillMaxWidth()
@@ -382,15 +375,16 @@ private fun GeneratorPage(
             TaskCard(
                 task = task,
                 onRemove = { TaskRepo.remove(task.id) },
-                onQuery = { detailTask = task }
+                onQuery = { detailTaskId = task.id }
             )
         }
 
         item { Spacer(Modifier.height(32.dp)) }
     }
 
+    val detailTask = detailTaskId?.let { id -> tasks.find { it.id == id } }
     detailTask?.let { t ->
-        TaskDetailDialog(task = t, onDismiss = { detailTask = null })
+        TaskDetailDialog(task = t, onDismiss = { detailTaskId = null })
     }
 }
 
@@ -401,11 +395,9 @@ private fun HistoryPage() {
     val ctx = LocalContext.current
     val repo = remember { HistoryRepo(ctx) }
     var records by remember { mutableStateOf(repo.list()) }
-    var refreshKey by remember { mutableStateOf(0) }
 
     fun refresh() {
         records = repo.list()
-        refreshKey++
     }
 
     LazyColumn(
@@ -441,10 +433,7 @@ private fun HistoryPage() {
 
         if (records.isEmpty()) {
             item {
-                Card(
-                    shape = RoundedCornerShape(20.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
+                Card(shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
                     Column(
                         Modifier.fillMaxWidth().padding(40.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
@@ -483,7 +472,7 @@ private fun HistoryPage() {
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "$plan · ${rec.size} · ${rec.fps}fps · ${(file.length() / 1024 / 1024)} MB",
+                        "$plan · ${rec.size} · ${rec.fps}fps · ${file.length() / 1024 / 1024} MB",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -594,7 +583,7 @@ private fun TaskCard(task: VideoTask, onRemove: () -> Unit, onQuery: () -> Unit)
                     modifier = Modifier.weight(1f)
                 )
                 IconButton(onClick = onQuery) {
-                    Icon(Icons.Filled.Info, contentDescription = "询问进度")
+                    Icon(Icons.Filled.Info, contentDescription = "查看详情")
                 }
                 IconButton(onClick = onRemove) {
                     Icon(Icons.Filled.Delete, contentDescription = "移除")
@@ -662,53 +651,6 @@ private fun TaskCard(task: VideoTask, onRemove: () -> Unit, onQuery: () -> Unit)
     }
 }
 
-private fun openVideo(ctx: android.content.Context, file: java.io.File) {
-    try {
-        val uri = androidx.core.content.FileProvider.getUriForFile(
-            ctx, ctx.packageName + ".fileprovider", file
-        )
-        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "video/mp4")
-            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        ctx.startActivity(intent)
-    } catch (_: Exception) { }
-}
-
-private fun enqueueWork(
-    ctx: android.content.Context,
-    taskId: String,
-    prompt: String,
-    duration: Int,
-    size: String,
-    fps: Int,
-    quality: String,
-    withAudio: Boolean,
-    watermark: Boolean,
-    initialImagePath: String?
-) {
-    val data = Data.Builder()
-        .putString("taskId", taskId)
-        .putString("prompt", prompt)
-        .putInt("duration", duration)
-        .putString("size", size)
-        .putInt("fps", fps)
-        .putString("quality", quality)
-        .putBoolean("withAudio", withAudio)
-        .putBoolean("watermark", watermark)
-        .apply { if (initialImagePath != null) putString("initialImagePath", initialImagePath) }
-        .build()
-
-    val request = OneTimeWorkRequestBuilder<VideoWorker>()
-        .setInputData(data)
-        .setConstraints(Constraints.Builder().build())
-        .addTag("aivideo")
-        .build()
-
-    WorkManager.getInstance(ctx).enqueueUniqueWork("aivideo_$taskId", ExistingWorkPolicy.REPLACE, request)
-}
-
-
 @Composable
 private fun TaskDetailDialog(task: VideoTask, onDismiss: () -> Unit) {
     Dialog(onDismissRequest = onDismiss) {
@@ -762,4 +704,50 @@ private fun TaskDetailDialog(task: VideoTask, onDismiss: () -> Unit) {
             }
         }
     }
+}
+
+private fun openVideo(ctx: android.content.Context, file: java.io.File) {
+    try {
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            ctx, ctx.packageName + ".fileprovider", file
+        )
+        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "video/mp4")
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        ctx.startActivity(intent)
+    } catch (_: Exception) { }
+}
+
+private fun enqueueWork(
+    ctx: android.content.Context,
+    taskId: String,
+    prompt: String,
+    duration: Int,
+    size: String,
+    fps: Int,
+    quality: String,
+    withAudio: Boolean,
+    watermark: Boolean,
+    initialImagePath: String?
+) {
+    val data = Data.Builder()
+        .putString("taskId", taskId)
+        .putString("prompt", prompt)
+        .putInt("duration", duration)
+        .putString("size", size)
+        .putInt("fps", fps)
+        .putString("quality", quality)
+        .putBoolean("withAudio", withAudio)
+        .putBoolean("watermark", watermark)
+        .apply { if (initialImagePath != null) putString("initialImagePath", initialImagePath) }
+        .build()
+
+    val request = OneTimeWorkRequestBuilder<VideoWorker>()
+        .setInputData(data)
+        .setConstraints(Constraints.Builder().build())
+        .addTag("aivideo")
+        .build()
+
+    WorkManager.getInstance(ctx).enqueueUniqueWork("aivideo_$taskId", ExistingWorkPolicy.REPLACE, request)
 }
