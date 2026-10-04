@@ -5,7 +5,6 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.ServiceInfo
 import android.os.Build
-import android.util.Base64
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
@@ -66,7 +65,7 @@ class VideoWorker(
                 }
             )
         }
-        setForeground(buildNotification(taskId, "准备中", 0, totalSegments))
+        setForeground(buildNotification("准备中，共 $totalSegments 段", 0, totalSegments))
 
         var currentImageBase64: String? = null
         val segmentFiles = mutableListOf<File>()
@@ -130,9 +129,8 @@ class VideoWorker(
                         i, totalSegments
                     )
                     val frameFile = File(framesDir, "frame_$i.jpg")
-                    if (FfmpegHelper.extractLastFrame(segFile, frameFile)) {
-                        currentImageBase64 = "data:image/jpeg;base64," +
-                            Base64.encodeToString(frameFile.readBytes(), Base64.NO_WRAP)
+                    if (VideoUtils.extractLastFrame(segFile, frameFile)) {
+                        currentImageBase64 = VideoUtils.jpgToBase64DataUri(frameFile)
                     } else {
                         currentImageBase64 = null
                     }
@@ -144,7 +142,6 @@ class VideoWorker(
                         error = "第 $segIndex 段失败：${e.message}"
                     )
                 }
-                // 已成功的段仍尝试拼接
                 if (segmentFiles.isNotEmpty()) {
                     updateProgress(taskId, "部分失败，尝试拼接已成功的段", i, totalSegments)
                     tryConcat(taskId, segmentFiles, workDir)
@@ -165,7 +162,7 @@ class VideoWorker(
 
     private fun tryConcat(taskId: String, segmentFiles: List<File>, workDir: File) {
         val finalFile = File(workDir, "final.mp4")
-        val ok = FfmpegHelper.concat(segmentFiles, finalFile, workDir)
+        val ok = VideoUtils.concat(applicationContext, segmentFiles, finalFile)
         if (ok && finalFile.exists() && finalFile.length() > 0) {
             TaskRepo.update(taskId) { it.copy(finalFile = finalFile) }
             try {
@@ -191,11 +188,10 @@ class VideoWorker(
 
     private fun updateProgress(taskId: String, msg: String, idx: Int, total: Int) {
         TaskRepo.update(taskId) { it.copy(progress = msg) }
-        setForeground(buildNotification(taskId, msg, idx, total))
+        setForeground(buildNotification(msg, idx, total))
     }
 
     private fun buildNotification(
-        taskId: String,
         msg: String,
         idx: Int,
         total: Int

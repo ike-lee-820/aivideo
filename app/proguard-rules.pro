@@ -1,2 +1,2 @@
--keep class com.arthenica.ffmpegkit.** { *; }
+-keep class androidx.media3.** { *; }
 -keep class com.google.gson.** { *; }

@@ -11,8 +11,8 @@ android {
         applicationId = "com.ikelee.aivideo"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     buildTypes {
@@ -36,7 +36,9 @@ android {
                 "META-INF/LICENSE",
                 "META-INF/LICENSE.txt",
                 "META-INF/NOTICE",
-                "META-INF/NOTICE.txt"
+                "META-INF/NOTICE.txt",
+                "META-INF/AL2.0",
+                "META-INF/LGPL2.1"
             )
         }
     }
@@ -62,8 +64,11 @@ dependencies {
     implementation("com.google.code.gson:gson:2.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // FFmpeg for Android (ARM64 + ARM32 + x86_64)
-    implementation("com.arthenica:ffmpeg-kit-min:6.0-2.LTS")
+    // 官方媒体处理库（替代 ffmpeg-kit）
+    implementation("androidx.media3:media3-transformer:1.4.1")
+    implementation("androidx.media3:media3-effect:1.4.1")
+    implementation("androidx.media3:media3-common:1.4.1")
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
