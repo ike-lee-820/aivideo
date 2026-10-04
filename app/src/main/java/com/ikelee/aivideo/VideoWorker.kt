@@ -22,6 +22,12 @@ class VideoWorker(
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
 
+    companion object {
+        const val POLL_INTERVAL_MS = 4000L      // 4 秒轮询
+        const val POLL_MAX_ATTEMPTS = 120        // 最长 8 分钟
+        const val NOTIFICATION_ID = 1001
+    }
+
     private val settingsRepo = SettingsRepo(applicationContext)
     private val historyRepo = HistoryRepo(applicationContext)
 
@@ -65,7 +71,6 @@ class VideoWorker(
         }
         setForeground(buildNotification("准备中，共 $totalSegments 段", 0, totalSegments))
 
-        // 首帧：用户上传的图片作为第 1 段的首帧
         var currentImageBase64: String? =
             if (!initialImagePath.isNullOrEmpty()) {
                 val f = File(initialImagePath)
@@ -77,8 +82,9 @@ class VideoWorker(
         for (i in 0 until totalSegments) {
             val segIndex = i + 1
             try {
+                // ---- 提交 ----
                 updateProgress(taskId, "第 $segIndex/$totalSegments 段：提交任务", i, totalSegments)
-                val remoteId = api.submit(
+                val submitResult = api.submit(
                     prompt = prompt,
                     imageBase64 = currentImageBase64,
                     duration = segDuration,
@@ -88,19 +94,48 @@ class VideoWorker(
                     withAudio = withAudio,
                     watermark = watermark
                 )
+                val remoteId = submitResult.taskId
 
+                // 把远端 taskId 和提交原始返回记录
+                TaskRepo.update(taskId) { t ->
+                    t.copy(
+                        lastSubmitRaw = submitResult.raw,
+                        segments = t.segments.mapIndexed { idx, s ->
+                            if (idx == i) s.copy(remoteId = remoteId, pollRaw = submitResult.raw)
+                            else s
+                        }
+                    )
+                }
+
+                // ---- 轮询（4 秒间隔）----
                 var videoUrl: String? = null
                 var attempts = 0
-                while (attempts < 100) {
-                    delay(3000)
+                while (attempts < POLL_MAX_ATTEMPTS) {
+                    delay(POLL_INTERVAL_MS)
                     attempts++
-                    updateProgress(
-                        taskId,
-                        "第 $segIndex/$totalSegments 段：轮询第 $attempts 次",
+                    val result = try { api.poll(remoteId) } catch (e: Exception) {
+                        PollResult("", null, "网络异常：${e.message}", "")
+                    }
+
+                    // 每次轮询都把原始返回写入任务
+                    val rawSnapshot = result.raw.ifEmpty { "（无返回内容）" }
+                    TaskRepo.update(taskId) { t ->
+                        t.copy(
+                            lastPollRaw = rawSnapshot,
+                            progress = "第 $segIndex/$totalSegments 段：轮询 ${attempts} 次",
+                            segments = t.segments.mapIndexed { idx, s ->
+                                if (idx == i) s.copy(pollRaw = rawSnapshot)
+                                else s
+                            }
+                        )
+                    }
+                    // 通知也同步更新
+                    updateNotification(
+                        "第 $segIndex/$totalSegments 段 · 轮询 $attempts",
                         i, totalSegments
                     )
-                    val result = try { api.poll(remoteId) } catch (_: Exception) { null }
-                    when (result?.status) {
+
+                    when (result.status) {
                         "SUCCESS" -> { videoUrl = result.videoUrl; break }
                         "FAIL" -> throw RuntimeException(result.error ?: "任务失败")
                         else -> continue
@@ -109,6 +144,7 @@ class VideoWorker(
 
                 if (videoUrl.isNullOrEmpty()) throw RuntimeException("轮询超时")
 
+                // ---- 下载 ----
                 updateProgress(taskId, "第 $segIndex/$totalSegments 段：下载视频", i, totalSegments)
                 val segFile = File(segmentsDir, "seg_$i.mp4")
                 downloadToFile(videoUrl, segFile)
@@ -117,11 +153,15 @@ class VideoWorker(
                 TaskRepo.update(taskId) { t ->
                     val newSegs = t.segments.toMutableList()
                     if (i < newSegs.size) {
-                        newSegs[i] = VideoSegment(i, videoUrl, segFile, segDuration)
+                        newSegs[i] = newSegs[i].copy(
+                            url = videoUrl,
+                            localFile = segFile
+                        )
                     }
                     t.copy(segments = newSegs)
                 }
 
+                // ---- 抽帧（作为下一段首帧）----
                 if (i < totalSegments - 1) {
                     updateProgress(taskId, "第 $segIndex/$totalSegments 段：提取最后一帧", i, totalSegments)
                     val frameFile = File(framesDir, "frame_$i.jpg")
@@ -146,6 +186,7 @@ class VideoWorker(
         }
 
         TaskRepo.update(taskId) { it.copy(status = TaskStatus.DONE, progress = "完成") }
+        updateNotification("完成", totalSegments, totalSegments)
         Result.success()
     }
 
@@ -160,7 +201,6 @@ class VideoWorker(
                     "aivideo_${taskId.take(8)}_${System.currentTimeMillis()}.mp4"
                 )
             } catch (_: Exception) {}
-            // 保存到历史
             val task = TaskRepo.tasks.value.find { it.id == taskId }
             if (task != null) {
                 historyRepo.save(finalFile, task, error)
@@ -185,6 +225,12 @@ class VideoWorker(
         setForeground(buildNotification(msg, idx, total))
     }
 
+    private suspend fun updateNotification(msg: String, idx: Int, total: Int) {
+        try {
+            setForeground(buildNotification(msg, idx, total))
+        } catch (_: Exception) {}
+    }
+
     private fun buildNotification(msg: String, idx: Int, total: Int): ForegroundInfo {
         val channelId = "aivideo_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -195,18 +241,20 @@ class VideoWorker(
                 )
             }
         }
+        val progress = ((idx.toFloat() / total.coerceAtLeast(1)) * 100).toInt().coerceIn(0, 100)
         val notif = NotificationCompat.Builder(applicationContext, channelId)
-            .setContentTitle("AI 视频生成中")
+            .setContentTitle("AI 视频生成中 · $progress%")
             .setContentText(msg)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
-            .setProgress(total.coerceAtLeast(1), idx, false)
+            .setOnlyAlertOnce(true)
+            .setProgress(100, progress, false)
             .build()
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ForegroundInfo(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            ForegroundInfo(NOTIFICATION_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
-            ForegroundInfo(1, notif)
+            ForegroundInfo(NOTIFICATION_ID, notif)
         }
     }
 }

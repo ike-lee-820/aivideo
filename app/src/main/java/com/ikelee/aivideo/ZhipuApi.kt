@@ -27,6 +27,7 @@ class ZhipuApi(private val settings: AppSettings) {
         else "$proxy/?url=" + URLEncoder.encode(target, "UTF-8")
     }
 
+    /** 提交任务，返回 (taskId, 原始 JSON) */
     fun submit(
         prompt: String,
         imageBase64: String?,
@@ -36,7 +37,7 @@ class ZhipuApi(private val settings: AppSettings) {
         quality: String,
         withAudio: Boolean,
         watermark: Boolean
-    ): String {
+    ): SubmitResult {
         val body = JsonObject().apply {
             addProperty("model", settings.model)
             addProperty("prompt", prompt)
@@ -59,10 +60,12 @@ class ZhipuApi(private val settings: AppSettings) {
             val text = resp.body?.string() ?: ""
             if (!resp.isSuccessful) throw RuntimeException("提交失败 HTTP ${resp.code}: $text")
             val obj = gson.fromJson(text, JsonObject::class.java)
-            return obj.get("id")?.asString ?: throw RuntimeException("未返回任务 ID: $text")
+            val id = obj.get("id")?.asString ?: throw RuntimeException("未返回任务 ID: $text")
+            return SubmitResult(id, text)
         }
     }
 
+    /** 轮询，返回 (状态, 视频URL, 错误, 原始 JSON) */
     fun poll(taskId: String): PollResult {
         val req = Request.Builder()
             .url(url("/async-result/$taskId"))
@@ -72,40 +75,31 @@ class ZhipuApi(private val settings: AppSettings) {
 
         client.newCall(req).execute().use { resp ->
             val text = resp.body?.string() ?: ""
-            if (!resp.isSuccessful) return PollResult("", null, "HTTP ${resp.code}: $text")
-            val obj = gson.fromJson(text, JsonObject::class.java)
-            val status = obj.get("task_status")?.asString ?: ""
+            if (!resp.isSuccessful) {
+                return PollResult("", null, "HTTP ${resp.code}: $text", text)
+            }
+            val obj = try { gson.fromJson(text, JsonObject::class.java) } catch (e: Exception) { null }
+            val status = obj?.get("task_status")?.asString ?: ""
             return when (status) {
                 "SUCCESS" -> {
                     val arr = obj.getAsJsonArray("video_result")
                     val videoUrl = arr?.get(0)?.asJsonObject?.get("url")?.asString
-                    PollResult(status, videoUrl, null)
+                    PollResult(status, videoUrl, null, text)
                 }
                 "FAIL" -> {
                     val err = obj.getAsJsonObject("error")?.get("message")?.asString ?: "任务失败"
-                    PollResult(status, null, err)
+                    PollResult(status, null, err, text)
                 }
-                else -> PollResult(status, null, null)
+                else -> PollResult(status, null, null, text)
             }
-        }
-    }
-
-    /** 直接返回原始 JSON 文本（用于"询问进度"显示原始内容） */
-    fun queryRaw(taskId: String): String {
-        val req = Request.Builder()
-            .url(url("/async-result/$taskId"))
-            .addHeader("Authorization", "Bearer ${settings.apiKey}")
-            .get()
-            .build()
-        return try {
-            client.newCall(req).execute().use { resp ->
-                val text = resp.body?.string() ?: ""
-                "HTTP ${resp.code} ${resp.message}\n\n$text"
-            }
-        } catch (e: Exception) {
-            "请求失败：" + (e.message ?: e.toString())
         }
     }
 }
 
-data class PollResult(val status: String, val videoUrl: String?, val error: String?)
+data class SubmitResult(val taskId: String, val raw: String)
+data class PollResult(
+    val status: String,
+    val videoUrl: String?,
+    val error: String?,
+    val raw: String
+)

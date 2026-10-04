@@ -161,8 +161,7 @@ private fun GeneratorPage(
     var watermark by remember { mutableStateOf(false) }
     var imagePath by remember { mutableStateOf<String?>(null) }
     var imageUriForPreview by remember { mutableStateOf<Uri?>(null) }
-    var queryDialogText by remember { mutableStateOf<String?>(null) }
-    var queryDialogLoading by remember { mutableStateOf(false) }
+    var detailTask by remember { mutableStateOf<VideoTask?>(null) }
 
     val pickImage = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
@@ -383,69 +382,15 @@ private fun GeneratorPage(
             TaskCard(
                 task = task,
                 onRemove = { TaskRepo.remove(task.id) },
-                onQuery = {
-                    queryDialogLoading = true
-                    queryDialogText = "请求中…"
-                    scope.launch {
-                        val api = ZhipuApi(settings)
-                        val remoteId = task.segments.firstOrNull()?.url?.let { "" } ?: ""
-                        // 取最新的 taskId：从 task 里保存的 taskId 字段取
-                        val text = withContext(Dispatchers.IO) {
-                            try {
-                                // 从 TaskRepo 里没有 taskId 字段；每次查询用当前任务段的最新 task id
-                                // 需要扩充 VideoTask 记录 taskId 列表，这里用简化：查询该任务的所有段
-                                buildString {
-                                    appendLine("任务信息")
-                                    appendLine("─────────────")
-                                    appendLine("任务 ID：${task.id}")
-                                    appendLine("提示词：${task.prompt}")
-                                    appendLine("状态：${task.status}")
-                                    appendLine("进度：${task.progress}")
-                                    appendLine("段数：${task.segments.size}")
-                                    appendLine()
-                                    appendLine("段列表")
-                                    appendLine("─────────────")
-                                    task.segments.forEach { seg ->
-                                        appendLine("第 ${seg.index + 1} 段 · ${seg.duration}s")
-                                        appendLine("  URL：${seg.url.ifEmpty { "（未生成）" }}")
-                                        appendLine("  本地：${seg.localFile?.absolutePath ?: "（未下载）"}")
-                                    }
-                                    appendLine()
-                                    appendLine("错误：${task.error ?: "无"}")
-                                }
-                            } catch (e: Exception) {
-                                "查询失败：" + (e.message ?: "")
-                            }
-                        }
-                        queryDialogText = text
-                        queryDialogLoading = false
-                    }
-                }
+                onQuery = { detailTask = task }
             )
         }
 
         item { Spacer(Modifier.height(32.dp)) }
     }
 
-    if (queryDialogText != null) {
-        Dialog(onDismissRequest = { queryDialogText = null }) {
-            Card(shape = RoundedCornerShape(20.dp)) {
-                Column(Modifier.padding(20.dp)) {
-                    Text("任务详情", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.height(12.dp))
-                    Text(
-                        queryDialogText ?: "",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.height(400.dp).fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        TextButton(onClick = { queryDialogText = null }) { Text("关闭") }
-                    }
-                }
-            }
-        }
+    detailTask?.let { t ->
+        TaskDetailDialog(task = t, onDismiss = { detailTask = null })
     }
 }
 
@@ -761,4 +706,60 @@ private fun enqueueWork(
         .build()
 
     WorkManager.getInstance(ctx).enqueueUniqueWork("aivideo_$taskId", ExistingWorkPolicy.REPLACE, request)
+}
+
+
+@Composable
+private fun TaskDetailDialog(task: VideoTask, onDismiss: () -> Unit) {
+    Dialog(onDismissRequest = onDismiss) {
+        Card(shape = RoundedCornerShape(20.dp)) {
+            Column(Modifier.padding(20.dp)) {
+                Text("任务详情", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(12.dp))
+                Box(Modifier.height(480.dp).fillMaxWidth()) {
+                    LazyColumn(Modifier.fillMaxSize()) {
+                        item {
+                            val sb = StringBuilder()
+                            sb.appendLine("【任务信息】")
+                            sb.appendLine("任务 ID：${task.id}")
+                            sb.appendLine("提示词：${task.prompt}")
+                            sb.appendLine("模型：${task.model}")
+                            sb.appendLine("时长：${task.duration}s")
+                            sb.appendLine("尺寸：${task.size}")
+                            sb.appendLine("帧率：${task.fps}fps")
+                            sb.appendLine("画质：${task.quality}")
+                            sb.appendLine("音效：${task.withAudio}")
+                            sb.appendLine("水印：${task.watermark}")
+                            sb.appendLine("状态：${task.status}")
+                            sb.appendLine("进度：${task.progress}")
+                            sb.appendLine("错误：${task.error ?: "无"}")
+                            sb.appendLine()
+                            sb.appendLine("【段列表】")
+                            task.segments.forEach { seg ->
+                                sb.appendLine("第 ${seg.index + 1} 段 · ${seg.duration}s")
+                                if (seg.remoteId.isNotEmpty()) sb.appendLine("  远端 ID：${seg.remoteId}")
+                                sb.appendLine("  URL：${seg.url.ifEmpty { "（未生成）" }}")
+                                sb.appendLine("  本地：${seg.localFile?.absolutePath ?: "（未下载）"}")
+                                sb.appendLine()
+                            }
+                            sb.appendLine("【最近一次提交原始返回】")
+                            sb.appendLine(task.lastSubmitRaw.ifEmpty { "（暂无）" })
+                            sb.appendLine()
+                            sb.appendLine("【最近一次轮询原始返回】")
+                            sb.appendLine(task.lastPollRaw.ifEmpty { "（暂无）" })
+                            Text(
+                                sb.toString(),
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = onDismiss) { Text("关闭") }
+                }
+            }
+        }
+    }
 }
