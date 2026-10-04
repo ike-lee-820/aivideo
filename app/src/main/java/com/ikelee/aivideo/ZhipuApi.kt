@@ -59,8 +59,14 @@ class ZhipuApi(private val settings: AppSettings) {
         client.newCall(req).execute().use { resp ->
             val text = resp.body?.string() ?: ""
             if (!resp.isSuccessful) throw RuntimeException("提交失败 HTTP ${resp.code}: $text")
-            val obj = gson.fromJson(text, JsonObject::class.java)
-            val id = obj.get("id")?.asString ?: throw RuntimeException("未返回任务 ID: $text")
+            val obj: JsonObject? = try {
+                gson.fromJson(text, JsonObject::class.java)
+            } catch (e: Exception) {
+                null
+            }
+            // 用安全调用，避免 nullable 报错
+            val id = obj?.get("id")?.asString
+                ?: throw RuntimeException("未返回任务 ID: $text")
             return SubmitResult(id, text)
         }
     }
@@ -78,8 +84,18 @@ class ZhipuApi(private val settings: AppSettings) {
             if (!resp.isSuccessful) {
                 return PollResult("", null, "HTTP ${resp.code}: $text", text)
             }
-            val obj = try { gson.fromJson(text, JsonObject::class.java) } catch (e: Exception) { null }
-            val status = obj?.get("task_status")?.asString ?: ""
+
+            val obj: JsonObject? = try {
+                gson.fromJson(text, JsonObject::class.java)
+            } catch (e: Exception) {
+                null
+            }
+            if (obj == null) {
+                return PollResult("", null, "响应不是合法 JSON: $text", text)
+            }
+
+            // 全部使用安全调用 ?.
+            val status = obj.get("task_status")?.asString ?: ""
             return when (status) {
                 "SUCCESS" -> {
                     val arr = obj.getAsJsonArray("video_result")
@@ -87,7 +103,9 @@ class ZhipuApi(private val settings: AppSettings) {
                     PollResult(status, videoUrl, null, text)
                 }
                 "FAIL" -> {
-                    val err = obj.getAsJsonObject("error")?.get("message")?.asString ?: "任务失败"
+                    val err = obj.getAsJsonObject("error")
+                        ?.get("message")?.asString
+                        ?: "任务失败"
                     PollResult(status, null, err, text)
                 }
                 else -> PollResult(status, null, null, text)
