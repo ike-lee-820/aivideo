@@ -73,7 +73,6 @@ class VideoWorker(
         for (i in 0 until totalSegments) {
             val segIndex = i + 1
             try {
-                // 1. 提交生成任务
                 updateProgress(taskId, "第 $segIndex/$totalSegments 段：提交任务", i, totalSegments)
                 val remoteId = api.submit(
                     prompt = prompt,
@@ -86,7 +85,6 @@ class VideoWorker(
                     watermark = watermark
                 )
 
-                // 2. 后台轮询
                 var videoUrl: String? = null
                 var attempts = 0
                 while (attempts < 100) {
@@ -107,7 +105,6 @@ class VideoWorker(
 
                 if (videoUrl.isNullOrEmpty()) throw RuntimeException("轮询超时，未返回视频")
 
-                // 3. 下载
                 updateProgress(taskId, "第 $segIndex/$totalSegments 段：下载视频", i, totalSegments)
                 val segFile = File(segmentsDir, "seg_$i.mp4")
                 downloadToFile(videoUrl, segFile)
@@ -121,7 +118,6 @@ class VideoWorker(
                     t.copy(segments = newSegs)
                 }
 
-                // 4. 提取最后一帧（作为下一段的首帧）
                 if (i < totalSegments - 1) {
                     updateProgress(
                         taskId,
@@ -150,7 +146,6 @@ class VideoWorker(
             }
         }
 
-        // 5. 全部完成，拼接
         if (segmentFiles.isNotEmpty()) {
             updateProgress(taskId, "拼接 $totalSegments 段视频", totalSegments - 1, totalSegments)
             tryConcat(taskId, segmentFiles, workDir)
@@ -186,7 +181,8 @@ class VideoWorker(
         }
     }
 
-    private fun updateProgress(taskId: String, msg: String, idx: Int, total: Int) {
+    /** 改成 suspend 才能调用 setForeground */
+    private suspend fun updateProgress(taskId: String, msg: String, idx: Int, total: Int) {
         TaskRepo.update(taskId) { it.copy(progress = msg) }
         setForeground(buildNotification(msg, idx, total))
     }
