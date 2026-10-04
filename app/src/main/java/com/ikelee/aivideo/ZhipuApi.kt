@@ -59,9 +59,7 @@ class ZhipuApi(private val settings: AppSettings) {
             val text = resp.body?.string() ?: ""
             if (!resp.isSuccessful) throw RuntimeException("提交失败 HTTP ${resp.code}: $text")
             val obj = gson.fromJson(text, JsonObject::class.java)
-            val id = obj.get("id")?.asString
-                ?: throw RuntimeException("未返回任务 ID: $text")
-            return id
+            return obj.get("id")?.asString ?: throw RuntimeException("未返回任务 ID: $text")
         }
     }
 
@@ -89,6 +87,23 @@ class ZhipuApi(private val settings: AppSettings) {
                 }
                 else -> PollResult(status, null, null)
             }
+        }
+    }
+
+    /** 直接返回原始 JSON 文本（用于"询问进度"显示原始内容） */
+    fun queryRaw(taskId: String): String {
+        val req = Request.Builder()
+            .url(url("/async-result/$taskId"))
+            .addHeader("Authorization", "Bearer ${settings.apiKey}")
+            .get()
+            .build()
+        return try {
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string() ?: ""
+                "HTTP ${resp.code} ${resp.message}\n\n$text"
+            }
+        } catch (e: Exception) {
+            "请求失败：" + (e.message ?: e.toString())
         }
     }
 }

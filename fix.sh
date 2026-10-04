@@ -1,3 +1,617 @@
+#!/usr/bin/env bash
+# ============================================================
+#  修复脚本 v3：图片上传 / 手动询问进度 / 历史记录 / 保留提示词
+#  位置：在 aivideo/ 目录下执行
+#  用法：bash fix-v3.sh
+# ============================================================
+
+set -e
+
+if [ ! -f "settings.gradle.kts" ] || [ ! -d "app" ]; then
+  echo "错误：请在 aivideo 项目根目录执行"
+  exit 1
+fi
+
+SRC="app/src/main/java/com/ikelee/aivideo"
+
+echo "[1/7] 更新 Models.kt（增加首帧路径 + 历史记录模型）..."
+cat > "$SRC/Models.kt" <<'KOTLIN'
+package com.ikelee.aivideo
+
+import java.io.File
+
+data class VideoTask(
+    val id: String,
+    val prompt: String,
+    val model: String = "cogvideox-flash",
+    val duration: Int = 10,
+    val size: String = "1920x1080",
+    val fps: Int = 30,
+    val quality: String = "quality",
+    val withAudio: Boolean = true,
+    val watermark: Boolean = false,
+    val initialImagePath: String? = null,
+    val status: TaskStatus = TaskStatus.RUNNING,
+    val progress: String = "",
+    val segments: List<VideoSegment> = emptyList(),
+    val error: String? = null,
+    val finalFile: File? = null,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+enum class TaskStatus { RUNNING, DONE, ERROR }
+
+data class VideoSegment(
+    val index: Int,
+    val url: String,
+    val localFile: File?,
+    val duration: Int
+)
+
+data class AppSettings(
+    val proxyBase: String = "https://api.ocd.ccwu.cc",
+    val apiKey: String = "d2796e4995984341be515ea937df0fff.bIRP2Zxo2j6UwQ70",
+    val model: String = "cogvideox-flash"
+)
+
+data class HistoryRecord(
+    val id: String,
+    val prompt: String,
+    val model: String,
+    val duration: Int,
+    val size: String,
+    val fps: Int,
+    val quality: String,
+    val withAudio: Boolean,
+    val watermark: Boolean,
+    val finalPath: String,
+    val segments: List<HistorySegment>,
+    val error: String?,
+    val createdAt: Long
+)
+
+data class HistorySegment(
+    val index: Int,
+    val url: String,
+    val duration: Int
+)
+KOTLIN
+
+echo "[2/7] 新增 ImageUtils.kt..."
+cat > "$SRC/ImageUtils.kt" <<'KOTLIN'
+package com.ikelee.aivideo
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.net.Uri
+import android.util.Base64
+import java.io.ByteArrayOutputStream
+import java.io.File
+
+object ImageUtils {
+
+    /**
+     * 从 URI 读图 → 缩放（保持宽高比）→ 压成 JPEG → 保存到 outputFile
+     * 目标：最长边 <= maxDim，文件 <= targetBytes
+     */
+    fun compressToJpegFile(
+        context: Context,
+        uri: Uri,
+        outputFile: File,
+        maxDim: Int = 1920,
+        targetBytes: Long = 1024L * 1024L
+    ): Boolean {
+        return try {
+            val input = context.contentResolver.openInputStream(uri) ?: return false
+            val original = input.use { BitmapFactory.decodeStream(it) } ?: return false
+
+            val srcW = original.width
+            val srcH = original.height
+            if (srcW <= 0 || srcH <= 0) {
+                original.recycle()
+                return false
+            }
+
+            // 等比缩放
+            var w = srcW
+            var h = srcH
+            if (w > maxDim || h > maxDim) {
+                if (w >= h) {
+                    h = (h.toLong() * maxDim / w).toInt().coerceAtLeast(1)
+                    w = maxDim
+                } else {
+                    w = (w.toLong() * maxDim / h).toInt().coerceAtLeast(1)
+                    h = maxDim
+                }
+            }
+
+            val scaled = if (w != srcW || h != srcH) {
+                Bitmap.createScaledBitmap(original, w, h, true).also {
+                    if (it !== original) original.recycle()
+                }
+            } else original
+
+            // 白底（透明图转 JPG 避免黑块）
+            val rgb = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(rgb)
+            canvas.drawColor(Color.WHITE)
+            canvas.drawBitmap(scaled, 0f, 0f, null)
+            if (scaled !== rgb) scaled.recycle()
+
+            // 迭代质量压缩
+            outputFile.parentFile?.mkdirs()
+            var quality = 92
+            var bytes: ByteArray
+            while (true) {
+                val baos = ByteArrayOutputStream()
+                rgb.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+                bytes = baos.toByteArray()
+                if (bytes.size <= targetBytes || quality <= 30) break
+                quality -= 8
+            }
+
+            // 依然太大 → 等比缩小再压
+            var shrinkW = w
+            var shrinkH = h
+            var shrinkRounds = 0
+            var currentBitmap = rgb
+            while (bytes.size > targetBytes && (shrinkW > 320 || shrinkH > 320) && shrinkRounds < 8) {
+                shrinkW = (shrinkW * 0.8).toInt().coerceAtLeast(1)
+                shrinkH = (shrinkH * 0.8).toInt().coerceAtLeast(1)
+                val next = Bitmap.createScaledBitmap(currentBitmap, shrinkW, shrinkH, true)
+                if (next !== currentBitmap) currentBitmap.recycle()
+                currentBitmap = next
+                val baos = ByteArrayOutputStream()
+                currentBitmap.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+                bytes = baos.toByteArray()
+                shrinkRounds++
+            }
+
+            outputFile.writeBytes(bytes)
+            currentBitmap.recycle()
+            outputFile.exists() && outputFile.length() > 0
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** JPG 文件 → data URI Base64 */
+    fun fileToDataUri(file: File): String? {
+        if (!file.exists() || file.length() == 0L) return null
+        return try {
+            "data:image/jpeg;base64," +
+                Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
+        } catch (e: Exception) {
+            null
+        }
+    }
+}
+KOTLIN
+
+echo "[3/7] 新增 HistoryRepo.kt..."
+cat > "$SRC/HistoryRepo.kt" <<'KOTLIN'
+package com.ikelee.aivideo
+
+import android.content.Context
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import java.io.File
+
+class HistoryRepo(ctx: Context) {
+
+    private val appCtx = ctx.applicationContext
+    private val sp = appCtx.getSharedPreferences("aivideo_history", Context.MODE_PRIVATE)
+    private val gson = Gson()
+    private val dir = File(appCtx.filesDir, "history").apply { mkdirs() }
+
+    private val KEY = "records_json"
+
+    fun list(): List<HistoryRecord> {
+        val json = sp.getString(KEY, null) ?: return emptyList()
+        return try {
+            val type = object : TypeToken<List<HistoryRecord>>() {}.type
+            gson.fromJson<List<HistoryRecord>>(json, type) ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * 把最终视频复制到内部历史目录，并记录元数据
+     * 返回保存后的 HistoryRecord（或 null 表示失败）
+     */
+    fun save(
+        srcVideo: File,
+        task: VideoTask,
+        error: String?
+    ): HistoryRecord? {
+        if (!srcVideo.exists() || srcVideo.length() == 0L) return null
+        val id = "h_" + System.currentTimeMillis() + "_" + (1000..9999).random()
+        val dst = File(dir, "$id.mp4")
+        return try {
+            srcVideo.copyTo(dst, overwrite = true)
+            val rec = HistoryRecord(
+                id = id,
+                prompt = task.prompt,
+                model = task.model,
+                duration = task.duration,
+                size = task.size,
+                fps = task.fps,
+                quality = task.quality,
+                withAudio = task.withAudio,
+                watermark = task.watermark,
+                finalPath = dst.absolutePath,
+                segments = task.segments.map {
+                    HistorySegment(it.index, it.url, it.duration)
+                },
+                error = error,
+                createdAt = System.currentTimeMillis()
+            )
+            val list = list().toMutableList()
+            list.add(0, rec)
+            sp.edit().putString(KEY, gson.toJson(list)).apply()
+            rec
+        } catch (e: Exception) {
+            try { dst.delete() } catch (_: Exception) {}
+            null
+        }
+    }
+
+    fun delete(id: String) {
+        val list = list().toMutableList()
+        val target = list.find { it.id == id }
+        if (target != null) {
+            try { File(target.finalPath).delete() } catch (_: Exception) {}
+        }
+        list.removeAll { it.id == id }
+        sp.edit().putString(KEY, gson.toJson(list)).apply()
+    }
+
+    fun clearAll() {
+        list().forEach { rec ->
+            try { File(rec.finalPath).delete() } catch (_: Exception) {}
+        }
+        sp.edit().remove(KEY).apply()
+    }
+}
+KOTLIN
+
+echo "[4/7] 更新 ZhipuApi.kt（加 queryRaw）..."
+cat > "$SRC/ZhipuApi.kt" <<'KOTLIN'
+package com.ikelee.aivideo
+
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
+
+class ZhipuApi(private val settings: AppSettings) {
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .writeTimeout(120, TimeUnit.SECONDS)
+        .build()
+
+    private val gson = Gson()
+    private val JSON = "application/json; charset=utf-8".toMediaType()
+
+    private fun url(path: String): String {
+        val target = "https://open.bigmodel.cn/api/paas/v4$path"
+        val proxy = settings.proxyBase.trim().trimEnd('/')
+        return if (proxy.isEmpty()) target
+        else "$proxy/?url=" + URLEncoder.encode(target, "UTF-8")
+    }
+
+    fun submit(
+        prompt: String,
+        imageBase64: String?,
+        duration: Int,
+        size: String,
+        fps: Int,
+        quality: String,
+        withAudio: Boolean,
+        watermark: Boolean
+    ): String {
+        val body = JsonObject().apply {
+            addProperty("model", settings.model)
+            addProperty("prompt", prompt)
+            addProperty("quality", quality)
+            addProperty("with_audio", withAudio)
+            addProperty("watermark_enabled", watermark)
+            addProperty("size", size)
+            addProperty("fps", fps)
+            addProperty("duration", duration)
+            if (!imageBase64.isNullOrEmpty()) addProperty("image_url", imageBase64)
+        }
+        val req = Request.Builder()
+            .url(url("/videos/generations"))
+            .addHeader("Authorization", "Bearer ${settings.apiKey}")
+            .addHeader("Content-Type", "application/json")
+            .post(gson.toJson(body).toRequestBody(JSON))
+            .build()
+
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string() ?: ""
+            if (!resp.isSuccessful) throw RuntimeException("提交失败 HTTP ${resp.code}: $text")
+            val obj = gson.fromJson(text, JsonObject::class.java)
+            return obj.get("id")?.asString ?: throw RuntimeException("未返回任务 ID: $text")
+        }
+    }
+
+    fun poll(taskId: String): PollResult {
+        val req = Request.Builder()
+            .url(url("/async-result/$taskId"))
+            .addHeader("Authorization", "Bearer ${settings.apiKey}")
+            .get()
+            .build()
+
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string() ?: ""
+            if (!resp.isSuccessful) return PollResult("", null, "HTTP ${resp.code}: $text")
+            val obj = gson.fromJson(text, JsonObject::class.java)
+            val status = obj.get("task_status")?.asString ?: ""
+            return when (status) {
+                "SUCCESS" -> {
+                    val arr = obj.getAsJsonArray("video_result")
+                    val videoUrl = arr?.get(0)?.asJsonObject?.get("url")?.asString
+                    PollResult(status, videoUrl, null)
+                }
+                "FAIL" -> {
+                    val err = obj.getAsJsonObject("error")?.get("message")?.asString ?: "任务失败"
+                    PollResult(status, null, err)
+                }
+                else -> PollResult(status, null, null)
+            }
+        }
+    }
+
+    /** 直接返回原始 JSON 文本（用于"询问进度"显示原始内容） */
+    fun queryRaw(taskId: String): String {
+        val req = Request.Builder()
+            .url(url("/async-result/$taskId"))
+            .addHeader("Authorization", "Bearer ${settings.apiKey}")
+            .get()
+            .build()
+        return try {
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string() ?: ""
+                "HTTP ${resp.code} ${resp.message}\n\n$text"
+            }
+        } catch (e: Exception) {
+            "请求失败：" + (e.message ?: e.toString())
+        }
+    }
+}
+
+data class PollResult(val status: String, val videoUrl: String?, val error: String?)
+KOTLIN
+
+echo "[5/7] 更新 VideoWorker.kt（支持首帧输入 + 完成后写入历史）..."
+cat > "$SRC/VideoWorker.kt" <<'KOTLIN'
+package com.ikelee.aivideo
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.content.pm.ServiceInfo
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.work.CoroutineWorker
+import androidx.work.ForegroundInfo
+import androidx.work.WorkerParameters
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+class VideoWorker(
+    appContext: Context,
+    params: WorkerParameters
+) : CoroutineWorker(appContext, params) {
+
+    private val settingsRepo = SettingsRepo(applicationContext)
+    private val historyRepo = HistoryRepo(applicationContext)
+
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(180, TimeUnit.SECONDS)
+        .build()
+
+    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        val taskId = inputData.getString("taskId") ?: return@withContext Result.failure()
+        val prompt = inputData.getString("prompt") ?: ""
+        val duration = inputData.getInt("duration", 10)
+        val size = inputData.getString("size") ?: "1920x1080"
+        val fps = inputData.getInt("fps", 30)
+        val quality = inputData.getString("quality") ?: "quality"
+        val withAudio = inputData.getBoolean("withAudio", true)
+        val watermark = inputData.getBoolean("watermark", false)
+        val initialImagePath = inputData.getString("initialImagePath")
+
+        val settings = settingsRepo.load()
+        if (settings.apiKey.isBlank()) {
+            TaskRepo.update(taskId) { it.copy(status = TaskStatus.ERROR, error = "API Key 未配置") }
+            return@withContext Result.failure()
+        }
+
+        val api = ZhipuApi(settings)
+        val workDir = File(applicationContext.filesDir, "tasks/$taskId").apply { mkdirs() }
+        val segmentsDir = File(workDir, "segments").apply { mkdirs() }
+        val framesDir = File(workDir, "frames").apply { mkdirs() }
+
+        val isMulti = duration > 10
+        val totalSegments = if (isMulti) (duration + 9) / 10 else 1
+        val segDuration = if (isMulti) 10 else duration
+
+        TaskRepo.update(taskId) {
+            it.copy(
+                status = TaskStatus.RUNNING,
+                progress = "准备中，共 $totalSegments 段",
+                segments = (0 until totalSegments).map { i -> VideoSegment(i, "", null, segDuration) }
+            )
+        }
+        setForeground(buildNotification("准备中，共 $totalSegments 段", 0, totalSegments))
+
+        // 首帧：用户上传的图片作为第 1 段的首帧
+        var currentImageBase64: String? =
+            if (!initialImagePath.isNullOrEmpty()) {
+                val f = File(initialImagePath)
+                if (f.exists()) ImageUtils.fileToDataUri(f) else null
+            } else null
+
+        val segmentFiles = mutableListOf<File>()
+
+        for (i in 0 until totalSegments) {
+            val segIndex = i + 1
+            try {
+                updateProgress(taskId, "第 $segIndex/$totalSegments 段：提交任务", i, totalSegments)
+                val remoteId = api.submit(
+                    prompt = prompt,
+                    imageBase64 = currentImageBase64,
+                    duration = segDuration,
+                    size = size,
+                    fps = fps,
+                    quality = quality,
+                    withAudio = withAudio,
+                    watermark = watermark
+                )
+
+                var videoUrl: String? = null
+                var attempts = 0
+                while (attempts < 100) {
+                    delay(3000)
+                    attempts++
+                    updateProgress(
+                        taskId,
+                        "第 $segIndex/$totalSegments 段：轮询第 $attempts 次",
+                        i, totalSegments
+                    )
+                    val result = try { api.poll(remoteId) } catch (_: Exception) { null }
+                    when (result?.status) {
+                        "SUCCESS" -> { videoUrl = result.videoUrl; break }
+                        "FAIL" -> throw RuntimeException(result.error ?: "任务失败")
+                        else -> continue
+                    }
+                }
+
+                if (videoUrl.isNullOrEmpty()) throw RuntimeException("轮询超时")
+
+                updateProgress(taskId, "第 $segIndex/$totalSegments 段：下载视频", i, totalSegments)
+                val segFile = File(segmentsDir, "seg_$i.mp4")
+                downloadToFile(videoUrl, segFile)
+                segmentFiles.add(segFile)
+
+                TaskRepo.update(taskId) { t ->
+                    val newSegs = t.segments.toMutableList()
+                    if (i < newSegs.size) {
+                        newSegs[i] = VideoSegment(i, videoUrl, segFile, segDuration)
+                    }
+                    t.copy(segments = newSegs)
+                }
+
+                if (i < totalSegments - 1) {
+                    updateProgress(taskId, "第 $segIndex/$totalSegments 段：提取最后一帧", i, totalSegments)
+                    val frameFile = File(framesDir, "frame_$i.jpg")
+                    currentImageBase64 = if (VideoUtils.extractLastFrame(segFile, frameFile)) {
+                        ImageUtils.fileToDataUri(frameFile)
+                    } else null
+                }
+            } catch (e: Exception) {
+                val errMsg = "第 $segIndex 段失败：${e.message}"
+                TaskRepo.update(taskId) { it.copy(status = TaskStatus.ERROR, error = errMsg) }
+                if (segmentFiles.isNotEmpty()) {
+                    updateProgress(taskId, "部分失败，拼接已成功段", i, totalSegments)
+                    tryConcat(taskId, segmentFiles, workDir, errMsg)
+                }
+                return@withContext Result.failure()
+            }
+        }
+
+        if (segmentFiles.isNotEmpty()) {
+            updateProgress(taskId, "拼接 $totalSegments 段", totalSegments - 1, totalSegments)
+            tryConcat(taskId, segmentFiles, workDir, null)
+        }
+
+        TaskRepo.update(taskId) { it.copy(status = TaskStatus.DONE, progress = "完成") }
+        Result.success()
+    }
+
+    private fun tryConcat(taskId: String, segments: List<File>, workDir: File, error: String?) {
+        val finalFile = File(workDir, "final.mp4")
+        val ok = VideoUtils.concat(applicationContext, segments, finalFile)
+        if (ok && finalFile.exists() && finalFile.length() > 0) {
+            TaskRepo.update(taskId) { it.copy(finalFile = finalFile) }
+            try {
+                MediaSaver.saveToGallery(
+                    applicationContext, finalFile,
+                    "aivideo_${taskId.take(8)}_${System.currentTimeMillis()}.mp4"
+                )
+            } catch (_: Exception) {}
+            // 保存到历史
+            val task = TaskRepo.tasks.value.find { it.id == taskId }
+            if (task != null) {
+                historyRepo.save(finalFile, task, error)
+            }
+        }
+    }
+
+    private fun downloadToFile(url: String, output: File) {
+        output.parentFile?.mkdirs()
+        if (output.exists()) output.delete()
+        val req = Request.Builder().url(url).get().build()
+        http.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) throw RuntimeException("下载失败 HTTP ${resp.code}")
+            resp.body?.byteStream()?.use { input ->
+                output.outputStream().use { input.copyTo(it) }
+            }
+        }
+    }
+
+    private suspend fun updateProgress(taskId: String, msg: String, idx: Int, total: Int) {
+        TaskRepo.update(taskId) { it.copy(progress = msg) }
+        setForeground(buildNotification(msg, idx, total))
+    }
+
+    private fun buildNotification(msg: String, idx: Int, total: Int): ForegroundInfo {
+        val channelId = "aivideo_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (nm.getNotificationChannel(channelId) == null) {
+                nm.createNotificationChannel(
+                    NotificationChannel(channelId, "视频生成", NotificationManager.IMPORTANCE_LOW)
+                )
+            }
+        }
+        val notif = NotificationCompat.Builder(applicationContext, channelId)
+            .setContentTitle("AI 视频生成中")
+            .setContentText(msg)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setOngoing(true)
+            .setProgress(total.coerceAtLeast(1), idx, false)
+            .build()
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            ForegroundInfo(1, notif)
+        }
+    }
+}
+KOTLIN
+
+echo "[6/7] 重写 MainScreen.kt..."
+cat > "$SRC/MainScreen.kt" <<'KOTLIN'
 package com.ikelee.aivideo
 
 import android.net.Uri
@@ -762,3 +1376,15 @@ private fun enqueueWork(
 
     WorkManager.getInstance(ctx).enqueueUniqueWork("aivideo_$taskId", ExistingWorkPolicy.REPLACE, request)
 }
+KOTLIN
+
+echo "[7/7] 提交并推送..."
+git add -A
+git commit -q -m "feat: 图片上传 + 手动询问进度 + 历史记录 + 保留提示词" || echo "  没有改动"
+git push origin main
+
+echo ""
+echo "============================================"
+echo "  已推送"
+echo "  Actions: https://github.com/ike-lee-820/aivideo/actions"
+echo "============================================"
